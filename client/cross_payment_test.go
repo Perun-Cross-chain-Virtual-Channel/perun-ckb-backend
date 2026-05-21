@@ -15,9 +15,12 @@ package client_test
 
 import (
 	"context"
-	"github.com/sirupsen/logrus"
 	"math/big"
 	"math/rand"
+	"testing"
+	"time"
+
+	"github.com/sirupsen/logrus"
 	"perun.network/go-perun/channel"
 	"perun.network/go-perun/client"
 	"perun.network/go-perun/log"
@@ -29,8 +32,6 @@ import (
 	"perun.network/perun-ckb-backend/transaction"
 	"polycry.pt/poly-go/sync"
 	pkgtest "polycry.pt/poly-go/test"
-	"testing"
-	"time"
 
 	clienttest "perun.network/go-perun/client/test"
 )
