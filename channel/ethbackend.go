@@ -25,6 +25,7 @@ import (
 	"math/big"
 	"perun.network/go-perun/channel"
 	"perun.network/go-perun/channel/multi"
+	gpwallet "perun.network/go-perun/wallet"
 	ckbaddress "perun.network/perun-ckb-backend/wallet/address"
 
 	ckbasset "perun.network/perun-ckb-backend/channel/asset"
@@ -185,6 +186,10 @@ func ToEthParams(params *channel.Params) (ChannelParams, error) {
 	}
 	var app common.Address
 	app.SetBytes(make([]byte, 20))
+	coord, err := coordinatorEthAddress(params.Coordinator)
+	if err != nil {
+		return ChannelParams{}, errors.WithMessage(err, "deriving coordinator ETH address")
+	}
 	return ChannelParams{
 		ChallengeDuration: new(big.Int).SetUint64(params.ChallengeDuration),
 		Nonce:             params.Nonce,
@@ -192,7 +197,43 @@ func ToEthParams(params *channel.Params) (ChannelParams, error) {
 		App:               app,
 		LedgerChannel:     params.LedgerChannel,
 		VirtualChannel:    params.VirtualChannel,
+		Coordinator:       coord,
 	}, nil
+}
+
+// coordinatorEthAddress derives the 20-byte ETH address from the coordinator's
+// SEC1 pubkey held in params.Coordinator. Absent coordinator → address(0),
+// matching the contract's None encoding. Prefers an explicit ETH backend entry
+// when present; otherwise derives from the CKB participant pubkey so the same
+// physical key produces the same address whichever backend the consumer used.
+func coordinatorEthAddress(coord map[gpwallet.BackendID]gpwallet.Address) (common.Address, error) {
+	var addr common.Address
+	if coord == nil {
+		return addr, nil
+	}
+	if a, ok := coord[EthBackendID]; ok {
+		ethBytes, err := a.MarshalBinary()
+		if err != nil {
+			return addr, errors.WithMessage(err, "marshalling coordinator ETH address")
+		}
+		addr.SetBytes(ethBytes)
+		return addr, nil
+	}
+	a, ok := coord[CKBBackendID]
+	if !ok {
+		return addr, nil
+	}
+	participant, ok := a.(*ckbaddress.Participant)
+	if !ok {
+		return addr, errors.New("coordinator address is not *address.Participant")
+	}
+	if participant.PubKey == nil {
+		return addr, errors.New("coordinator participant has nil pubkey")
+	}
+	uncompressed := participant.PubKey.SerializeUncompressed()
+	ethHash := crypto.Keccak256(uncompressed[1:])
+	copy(addr[:], ethHash[12:32])
+	return addr, nil
 }
 
 // EncodeEthState encodes the state as with abi.encode() in the smart contracts.
@@ -356,8 +397,14 @@ type ChannelSubAlloc struct {
 }
 
 // EncodeChannelParams encodes the ChannelParams struct using the ABI encoding.
+//
+// The tuple order — including the trailing `coordinator` address — must match
+// the Solidity Channel.Params struct used by the ETH backend, otherwise
+// CalcID() produces different channel IDs on CKB vs ETH and multi-ledger
+// channels fail to identify themselves. See
+// perun-eth-backend@v0.6.1-0.20260525091241-e1f6c19121e0/channel/backend.go
+// (abiParams loaded from the contract's channelID method input).
 func EncodeChannelParams(params *ChannelParams) ([]byte, error) {
-	// Define the top-level ABI type for the ChannelParams struct.
 	paramsType, err := abi.NewType("tuple", "", []abi.ArgumentMarshaling{
 		{Name: "challengeDuration", Type: "uint256"},
 		{Name: "nonce", Type: "uint256"},
@@ -368,17 +415,16 @@ func EncodeChannelParams(params *ChannelParams) ([]byte, error) {
 		{Name: "app", Type: "address"},
 		{Name: "ledgerChannel", Type: "bool"},
 		{Name: "virtualChannel", Type: "bool"},
+		{Name: "coordinator", Type: "address"},
 	})
 	if err != nil {
 		return nil, err
 	}
 
-	// Define the Arguments.
 	args := abi.Arguments{
 		{Type: paramsType},
 	}
 
-	// Pack the data for encoding.
 	return args.Pack(
 		struct {
 			ChallengeDuration *big.Int
@@ -390,6 +436,7 @@ func EncodeChannelParams(params *ChannelParams) ([]byte, error) {
 			App            common.Address
 			LedgerChannel  bool
 			VirtualChannel bool
+			Coordinator    common.Address
 		}{
 			ChallengeDuration: params.ChallengeDuration,
 			Nonce:             params.Nonce,
@@ -415,6 +462,7 @@ func EncodeChannelParams(params *ChannelParams) ([]byte, error) {
 			App:            params.App,
 			LedgerChannel:  params.LedgerChannel,
 			VirtualChannel: params.VirtualChannel,
+			Coordinator:    params.Coordinator,
 		},
 	)
 }
@@ -427,6 +475,7 @@ type ChannelParams struct {
 	App               common.Address
 	LedgerChannel     bool
 	VirtualChannel    bool
+	Coordinator       common.Address
 }
 
 // ChannelParticipant is an auto generated low-level Go binding around an user-defined struct.

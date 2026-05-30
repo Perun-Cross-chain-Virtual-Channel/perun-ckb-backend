@@ -15,6 +15,7 @@ func NewRandomChannelStatus(rng *rand.Rand, opts ...ChannelStatusOpt) *molecule.
 	s := molecule.NewChannelStatusBuilder()
 	s.Funded(encoding.FromBool(rng.Intn(2) == 1))
 	s.Disputed(encoding.FromBool(rng.Intn(2) == 1))
+	s.Coordinated(encoding.False)
 
 	for _, opt := range opts {
 		opt(s)

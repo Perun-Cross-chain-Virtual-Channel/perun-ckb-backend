@@ -74,6 +74,23 @@ type CKBClient interface {
 	// later than the expiration of the challenge duration.
 	ForceCloseWithVC(ctx context.Context, id channel.ID, vcid channel.ID, state *channel.State, vcstate *channel.State, sigs []wallet.Sig, params *channel.Params, indexMap []channel.Index) error
 
+	// Coordinate locks the channel with the given id to the canonical state by
+	// submitting a `coordinate` action on-chain. The implementation can assume
+	// the channel has been disputed and the challenge window has elapsed
+	// (the contract verifies this; if it has not, the tx will revert).
+	// canonicalState.Version must be >= the on-chain state's version.
+	// sigs are the two participant signatures over canonicalState; coordSig is
+	// the coordinator signature over canonicalState. Note: the given signatures
+	// are padded (see encoding.NewMoleculeSignature).
+	Coordinate(ctx context.Context, id channel.ID, canonicalState *channel.State, sigs []wallet.Sig, coordSig wallet.Sig, params *channel.Params) error
+
+	// CoordinateVC locks both the parent ledger channel and its virtual channel
+	// to their canonical states in a single transaction. Mirrors the eth-backend
+	// recursive coordinate. parentSigs/vcSigs are participant signatures over
+	// the respective canonical states; parentCoordSig/vcCoordSig are the
+	// coordinator signatures.
+	CoordinateVC(ctx context.Context, parentID, vcID channel.ID, parentState, vcState *channel.State, parentSigs, vcSigs []wallet.Sig, parentCoordSig, vcCoordSig wallet.Sig, parentParams, vcParams *channel.Params) error
+
 	// GetChannelWithID returns an on-chain channel with the given channel ID.
 	// Note: Only the channel ID field in the state must be checked, as the pcts verifies the integrity of said
 	// field upon channel start (i.e. that it is equal to the hash of the channel parameters).
@@ -636,6 +653,127 @@ func (c Client) DisputeVC(ctx context.Context, vcID, parentID channel.ID, vcStat
 	tx, err := builder.Build(c.signer.Contexts())
 	if err != nil {
 		return fmt.Errorf("building dispute transaction: %w", err)
+	}
+	return c.submitTx(ctx, tx)
+}
+
+func (c Client) Coordinate(ctx context.Context, id channel.ID, canonicalState *channel.State, sigs []wallet.Sig, coordSig wallet.Sig, params *channel.Params) error {
+	log.Println("Coordinate called")
+	if len(sigs) != 2 {
+		return fmt.Errorf("expected 2 participant signatures, got %d", len(sigs))
+	}
+	if len(coordSig) == 0 {
+		return fmt.Errorf("coordinator signature is empty")
+	}
+
+	channelCell, status, err := c.getChannelLiveCellWithCache(ctx, id)
+	if err != nil {
+		return fmt.Errorf("getting channel live cell: %w", err)
+	}
+	onChainVersion := molecule2.UnpackUint64(status.State().Version())
+	if canonicalState.Version < onChainVersion {
+		return fmt.Errorf("canonical state version %d is below on-chain version %d", canonicalState.Version, onChainVersion)
+	}
+
+	header, err := retryRPC(ctx, 3, 10*time.Second, func() (*types.Header, error) {
+		return c.client.GetTipHeader(ctx)
+	})
+	if err != nil {
+		return fmt.Errorf("getting tip header: %w", err)
+	}
+
+	ci := transaction.NewCoordinateInfo(
+		*channelCell.OutPoint,
+		*status,
+		canonicalState,
+		params,
+		header.Hash,
+		channelCell.Output.Type,
+		sigs[0], sigs[1], coordSig,
+		channelCell.Output.Capacity,
+	)
+
+	builder, err := c.newPerunTransactionBuilder(nil)
+	if err != nil {
+		return fmt.Errorf("creating Perun transaction builder: %w", err)
+	}
+	if err := builder.Coordinate(ci); err != nil {
+		return fmt.Errorf("creating coordinate transaction: %w", err)
+	}
+	tx, err := builder.Build(c.signer.Contexts())
+	if err != nil {
+		return fmt.Errorf("building coordinate transaction: %w", err)
+	}
+	return c.submitTx(ctx, tx)
+}
+
+func (c Client) CoordinateVC(ctx context.Context, parentID, vcID channel.ID, parentState, vcState *channel.State, parentSigs, vcSigs []wallet.Sig, parentCoordSig, vcCoordSig wallet.Sig, parentParams, vcParams *channel.Params) error {
+	log.Println("CoordinateVC called")
+	if len(parentSigs) != 2 || len(vcSigs) != 2 {
+		return fmt.Errorf("expected 2 participant signatures per channel, got parent=%d vc=%d", len(parentSigs), len(vcSigs))
+	}
+	if len(parentCoordSig) == 0 || len(vcCoordSig) == 0 {
+		return fmt.Errorf("coordinator signatures are empty (parent=%d vc=%d)", len(parentCoordSig), len(vcCoordSig))
+	}
+
+	parentCell, parentStatus, err := c.getChannelLiveCellWithCache(ctx, parentID)
+	if err != nil {
+		return fmt.Errorf("getting parent channel live cell: %w", err)
+	}
+	if onV := molecule2.UnpackUint64(parentStatus.State().Version()); parentState.Version < onV {
+		return fmt.Errorf("canonical parent state version %d below on-chain %d", parentState.Version, onV)
+	}
+
+	vcCells, vcStatuses, err := c.getVirtualChannelLiveCellWithCache(ctx, vcID)
+	if err != nil {
+		return fmt.Errorf("getting virtual channel live cell: %w", err)
+	}
+	if len(vcCells) != 1 {
+		return fmt.Errorf("CoordinateVC requires exactly one VC cell, got %d", len(vcCells))
+	}
+	vcCell := vcCells[0]
+	vcStatus := vcStatuses[0]
+	if onV := molecule2.UnpackUint64(vcStatus.Vcstate().Version()); vcState.Version < onV {
+		return fmt.Errorf("canonical vc state version %d below on-chain %d", vcState.Version, onV)
+	}
+
+	header, err := retryRPC(ctx, 3, 10*time.Second, func() (*types.Header, error) {
+		return c.client.GetTipHeader(ctx)
+	})
+	if err != nil {
+		return fmt.Errorf("getting tip header: %w", err)
+	}
+
+	ci := &transaction.VCCoordinateInfo{
+		ChannelCell:          *parentCell.OutPoint,
+		LCStatus:             *parentStatus,
+		LCState:              parentState,
+		LCSigA:               parentSigs[0],
+		LCSigB:               parentSigs[1],
+		LCCoordSig:           parentCoordSig,
+		VCCell:               *vcCell.OutPoint,
+		VCStatus:             *vcStatus,
+		VCState:              vcState,
+		VCSigA:               vcSigs[0],
+		VCSigB:               vcSigs[1],
+		VCCoordSig:           vcCoordSig,
+		Header:               header.Hash,
+		PCTS:                 parentCell.Output.Type,
+		VCTS:                 vcCell.Output.Type,
+		InputChannelCapacity: parentCell.Output.Capacity,
+		InputVCCapacity:      vcCell.Output.Capacity,
+	}
+
+	builder, err := c.newPerunTransactionBuilder(nil)
+	if err != nil {
+		return fmt.Errorf("creating Perun transaction builder: %w", err)
+	}
+	if err := builder.CoordinateVC(ci); err != nil {
+		return fmt.Errorf("creating vc coordinate transaction: %w", err)
+	}
+	tx, err := builder.Build(c.signer.Contexts())
+	if err != nil {
+		return fmt.Errorf("building vc coordinate transaction: %w", err)
 	}
 	return c.submitTx(ctx, tx)
 }
