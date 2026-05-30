@@ -123,6 +123,20 @@ func (psh *PerunScriptHandler) BuildTransaction(builder collector.TransactionBui
 			forceCloseInfo = &v
 		}
 		return psh.buildForceCloseTransaction(builder, group, forceCloseInfo)
+	case CoordinateInfo, *CoordinateInfo:
+		var coordinateInfo *CoordinateInfo
+		if coordinateInfo, ok = context.(*CoordinateInfo); !ok {
+			v, _ := context.(CoordinateInfo)
+			coordinateInfo = &v
+		}
+		return psh.buildCoordinateTransaction(builder, group, coordinateInfo)
+	case VCCoordinateInfo, *VCCoordinateInfo:
+		var vcCoordinateInfo *VCCoordinateInfo
+		if vcCoordinateInfo, ok = context.(*VCCoordinateInfo); !ok {
+			v, _ := context.(VCCoordinateInfo)
+			vcCoordinateInfo = &v
+		}
+		return psh.buildVCCoordinateTransaction(builder, group, vcCoordinateInfo)
 	default:
 	}
 	return ok, nil
@@ -945,6 +959,133 @@ func (psh PerunScriptHandler) mkWitnessClose(state *channel.State, paddedSigs []
 func (psh PerunScriptHandler) mkWitnessForceClose() []byte {
 	w := molecule.NewChannelWitnessBuilder().Set(molecule.ChannelWitnessUnionFromForceClose(molecule.ForceCloseDefault())).Build()
 	return w.AsSlice()
+}
+
+// mkWitnessCoordinate packs a Coordinate redeemer carrying the canonical state,
+// both participant signatures, and the coordinator signature. PackCoordinateWitness
+// normalises the three sigs through NewMoleculeSignature.
+func (psh PerunScriptHandler) mkWitnessCoordinate(state *channel.State, sigA, sigB, coordSig wallet.Sig) ([]byte, error) {
+	ps, err := encoding.PackChannelState(state)
+	if err != nil {
+		return nil, fmt.Errorf("packing canonical state: %w", err)
+	}
+	w, err := encoding.PackCoordinateWitness(ps, sigA, sigB, coordSig)
+	if err != nil {
+		return nil, fmt.Errorf("packing coordinate witness: %w", err)
+	}
+	return w.AsSlice(), nil
+}
+
+func (psh *PerunScriptHandler) buildCoordinateTransaction(
+	builder collector.TransactionBuilder,
+	_ *transaction.ScriptGroup,
+	info *CoordinateInfo,
+) (bool, error) {
+	if len(psh.omniLockScriptDep) != 0 {
+		builder.AddCellDep(&psh.omniLockScriptDep[0])
+		builder.AddCellDep(&psh.omniLockScriptDep[1])
+	}
+	builder.AddCellDep(&psh.pclsDep)
+	builder.AddCellDep(&psh.pctsDep)
+	builder.AddCellDep(&psh.pflsDep)
+	builder.AddCellDep(&psh.defaultLockScriptDep)
+	psh.AddSudtCellDeps(builder)
+	builder.AddHeaderDep(info.Header)
+
+	witness, err := psh.mkWitnessCoordinate(info.NewState, info.SigA, info.SigB, info.CoordSig)
+	if err != nil {
+		return false, err
+	}
+
+	channelInputIdx := builder.AddInput(&types.CellInput{
+		Since:          0,
+		PreviousOutput: &info.ChannelCell,
+	})
+	if err := builder.SetWitness(uint(channelInputIdx), types.WitnessTypeInputType, witness); err != nil {
+		return false, fmt.Errorf("setting coordinate witness: %w", err)
+	}
+
+	newStatus, err := info.updatedStatus()
+	if err != nil {
+		return false, err
+	}
+
+	channelLock := psh.mkChannelLockScript()
+	channelCell := types.CellOutput{
+		Capacity: 0,
+		Lock:     channelLock,
+		Type:     info.PCTS,
+	}
+	channelCell.Capacity = preservedChannelCapacity(channelCell, newStatus.AsSlice(), info.InputChannelCapacity)
+	builder.AddOutput(&channelCell, newStatus.AsSlice())
+	return true, nil
+}
+
+func (psh *PerunScriptHandler) buildVCCoordinateTransaction(
+	builder collector.TransactionBuilder,
+	_ *transaction.ScriptGroup,
+	info *VCCoordinateInfo,
+) (bool, error) {
+	if len(psh.omniLockScriptDep) != 0 {
+		builder.AddCellDep(&psh.omniLockScriptDep[0])
+		builder.AddCellDep(&psh.omniLockScriptDep[1])
+	}
+	builder.AddCellDep(&psh.pclsDep)
+	builder.AddCellDep(&psh.pctsDep)
+	builder.AddCellDep(&psh.pflsDep)
+	builder.AddCellDep(&psh.vclsDep)
+	builder.AddCellDep(&psh.vctsDep)
+	builder.AddCellDep(&psh.defaultLockScriptDep)
+	psh.AddSudtCellDeps(builder)
+	builder.AddHeaderDep(info.Header)
+
+	lcWitness, err := psh.mkWitnessCoordinate(info.LCState, info.LCSigA, info.LCSigB, info.LCCoordSig)
+	if err != nil {
+		return false, fmt.Errorf("building LC coordinate witness: %w", err)
+	}
+	vcWitness, err := psh.mkWitnessCoordinate(info.VCState, info.VCSigA, info.VCSigB, info.VCCoordSig)
+	if err != nil {
+		return false, fmt.Errorf("building VC coordinate witness: %w", err)
+	}
+
+	lcIdx := builder.AddInput(&types.CellInput{Since: 0, PreviousOutput: &info.ChannelCell})
+	if err := builder.SetWitness(uint(lcIdx), types.WitnessTypeInputType, lcWitness); err != nil {
+		return false, fmt.Errorf("setting LC coordinate witness: %w", err)
+	}
+	vcIdx := builder.AddInput(&types.CellInput{Since: 0, PreviousOutput: &info.VCCell})
+	if err := builder.SetWitness(uint(vcIdx), types.WitnessTypeInputType, vcWitness); err != nil {
+		return false, fmt.Errorf("setting VC coordinate witness: %w", err)
+	}
+
+	newLCStatus, err := info.updatedLCStatus()
+	if err != nil {
+		return false, err
+	}
+	newVCStatus, err := info.updatedVCStatus()
+	if err != nil {
+		return false, err
+	}
+
+	channelLock := psh.mkChannelLockScript()
+	channelCell := types.CellOutput{
+		Capacity: 0,
+		Lock:     channelLock,
+		Type:     info.PCTS,
+	}
+	channelCell.Capacity = preservedChannelCapacity(channelCell, newLCStatus.AsSlice(), info.InputChannelCapacity)
+
+	vcLock := psh.mkVirtualChannelLockScript()
+	vcCell := types.CellOutput{
+		Capacity: 0,
+		Lock:     vcLock,
+		Type:     info.VCTS,
+	}
+	vcCell.Capacity = preservedChannelCapacity(vcCell, newVCStatus.AsSlice(), info.InputVCCapacity)
+
+	// Mirror mk_vc_coordinate output order: LC cell first, then VC cell.
+	builder.AddOutput(&channelCell, newLCStatus.AsSlice())
+	builder.AddOutput(&vcCell, newVCStatus.AsSlice())
+	return true, nil
 }
 
 func GetCKByteBalance(index int, state *channel.State) (uint64, error) {

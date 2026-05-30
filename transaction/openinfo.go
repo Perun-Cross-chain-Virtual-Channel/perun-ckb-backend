@@ -66,6 +66,7 @@ func mkInitialChannelStatus(state *channel.State) (molecule.ChannelStatus, error
 		Disputed(encoding.False).
 		VcDisputed(encoding.False).
 		VctsHash(molecule.Byte32Default()).
+		Coordinated(encoding.False).
 		Build(), nil
 }
 

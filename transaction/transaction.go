@@ -203,6 +203,16 @@ func (ptb *PerunTransactionBuilder) ForceClose(fci *ForceCloseInfo) error {
 	return err
 }
 
+func (ptb *PerunTransactionBuilder) Coordinate(ci *CoordinateInfo) error {
+	_, err := ptb.psh.buildCoordinateTransaction(ptb, nil, ci)
+	return err
+}
+
+func (ptb *PerunTransactionBuilder) CoordinateVC(ci *VCCoordinateInfo) error {
+	_, err := ptb.psh.buildVCCoordinateTransaction(ptb, nil, ci)
+	return err
+}
+
 func (ptb *PerunTransactionBuilder) ForceCloseWithVC(fcvi *ForceCloseWithVCInfo) error {
 	var err error
 	if !fcvi.firstForceClose {

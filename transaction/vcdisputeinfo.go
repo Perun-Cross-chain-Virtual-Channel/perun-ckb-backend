@@ -106,6 +106,7 @@ func (di *VcDisputeInfo) mkInitialVirtualChannelStatus() (molecule.VirtualChanne
 		Parents(*di.ParentsVec).
 		FirstForceClose(encoding.False).
 		Owner(ownerPacked).
+		Coordinated(encoding.False).
 		Build(), nil
 }
 
