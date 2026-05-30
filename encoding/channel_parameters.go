@@ -40,6 +40,11 @@ func PackChannelParameters(params *channel.Params) (molecule.ChannelParameters, 
 		return molecule.ChannelParameters{}, fmt.Errorf("packing nonce: %w", err)
 	}
 
+	coord, err := PackCoordinator(params.Coordinator)
+	if err != nil {
+		return molecule.ChannelParameters{}, fmt.Errorf("packing coordinator: %w", err)
+	}
+
 	return molecule.NewChannelParametersBuilder().
 		App(NoApp).
 		IsLedgerChannel(isLedgerChannel).
@@ -48,7 +53,34 @@ func PackChannelParameters(params *channel.Params) (molecule.ChannelParameters, 
 		PartyB(b).
 		Nonce(*nonce).
 		ChallengeDuration(*types.PackUint64(params.ChallengeDuration)).
+		Coordinator(coord).
 		Build(), nil
+}
+
+// PackCoordinator converts the coordinator address map from channel.Params into
+// the optional molecule Coordinator (SEC1-compressed pubkey). Absent → the None
+// arm. The on-chain PCTS verifies coordinator signatures against this pubkey.
+//
+// The ABI/CalcID side encodes the coordinator as the 20-byte ETH address derived
+// from this pubkey (see channel/ethbackend.go); the two encodings serve distinct
+// purposes and must not be confused.
+func PackCoordinator(coord map[gpwallet.BackendID]gpwallet.Address) (molecule.Coordinator, error) {
+	if coord == nil {
+		return molecule.CoordinatorDefault(), nil
+	}
+	addr, ok := coord[address.CKBBackendID]
+	if !ok {
+		return molecule.CoordinatorDefault(), nil
+	}
+	participant, ok := addr.(*address.Participant)
+	if !ok {
+		return molecule.Coordinator{}, errors.New("coordinator address is not *address.Participant")
+	}
+	pubKey, err := address.PackSEC1EncodedPubKey(participant.PubKey)
+	if err != nil {
+		return molecule.Coordinator{}, fmt.Errorf("packing coordinator pubkey: %w", err)
+	}
+	return molecule.NewCoordinatorBuilder().Set(pubKey).Build(), nil
 }
 
 // PackAddressToOnChainParticipant converts a perun ckb address to a molecule Participant.
