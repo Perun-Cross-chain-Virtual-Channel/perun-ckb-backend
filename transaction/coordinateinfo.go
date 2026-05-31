@@ -34,11 +34,14 @@ type CoordinateInfo struct {
 	Status      molecule.ChannelStatus
 	NewState    *channel.State
 	Params      *channel.Params
-	Header      types.Hash
-	PCTS        *types.Script
-	SigA        gpwallet.Sig
-	SigB        gpwallet.Sig
-	CoordSig    gpwallet.Sig
+	// Headers must include the block header of the channel input cell (for the
+	// contract's load_header(0, GroupInput) in verify_time_lock_expired) and the
+	// current tip header (for find_closest_current_time). Mirrors ForceCloseInfo.
+	Headers  []types.Hash
+	PCTS     *types.Script
+	SigA     gpwallet.Sig
+	SigB     gpwallet.Sig
+	CoordSig gpwallet.Sig
 
 	// InputChannelCapacity is the actual capacity of the channel cell being
 	// consumed. The rebuilt channel cell preserves it so the reserved sub-alloc
@@ -52,7 +55,7 @@ func NewCoordinateInfo(
 	status molecule.ChannelStatus,
 	newState *channel.State,
 	params *channel.Params,
-	header types.Hash,
+	headers []types.Hash,
 	pcts *types.Script,
 	sigA, sigB, coordSig gpwallet.Sig,
 	inputChannelCapacity uint64,
@@ -62,7 +65,7 @@ func NewCoordinateInfo(
 		Status:               status,
 		NewState:             newState,
 		Params:               params,
-		Header:               header,
+		Headers:              headers,
 		PCTS:                 pcts,
 		SigA:                 sigA,
 		SigB:                 sigB,

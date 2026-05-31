@@ -47,9 +47,12 @@ type VCCoordinateInfo struct {
 	VCCoordSig gpwallet.Sig
 
 	Params types.Hash // placeholder; unused — kept symmetric with VcDisputeInfo
-	Header types.Hash
-	PCTS   *types.Script
-	VCTS   *types.Script
+	// Headers must include the parent channel cell's block, the VC cell's block
+	// (each script's load_header(0, GroupInput) in verify_time_lock_expired), and
+	// the current tip (find_closest_current_time).
+	Headers []types.Hash
+	PCTS    *types.Script
+	VCTS    *types.Script
 
 	// InputChannelCapacity / InputVCCapacity preserve the consumed cells'
 	// capacities into the rebuilt output cells, mirroring the dispute path.

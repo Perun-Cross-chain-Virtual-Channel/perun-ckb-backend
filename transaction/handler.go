@@ -588,7 +588,9 @@ func (psh *PerunScriptHandler) buildVCMergeTransaction(builder collector.Transac
 	builder.AddCellDep(&psh.vclsDep)
 	builder.AddCellDep(&psh.vctsDep)
 	builder.AddCellDep(&psh.vclsDep)
-	builder.AddHeaderDep(disputeInfo.Header)
+	for _, h := range disputeInfo.Headers {
+		builder.AddHeaderDep(h)
+	}
 
 	// Inputs
 	vc0InputIndex := builder.AddInput(&types.CellInput{
@@ -990,7 +992,9 @@ func (psh *PerunScriptHandler) buildCoordinateTransaction(
 	builder.AddCellDep(&psh.pflsDep)
 	builder.AddCellDep(&psh.defaultLockScriptDep)
 	psh.AddSudtCellDeps(builder)
-	builder.AddHeaderDep(info.Header)
+	for _, h := range info.Headers {
+		builder.AddHeaderDep(h)
+	}
 
 	witness, err := psh.mkWitnessCoordinate(info.NewState, info.SigA, info.SigB, info.CoordSig)
 	if err != nil {
@@ -1037,7 +1041,9 @@ func (psh *PerunScriptHandler) buildVCCoordinateTransaction(
 	builder.AddCellDep(&psh.vctsDep)
 	builder.AddCellDep(&psh.defaultLockScriptDep)
 	psh.AddSudtCellDeps(builder)
-	builder.AddHeaderDep(info.Header)
+	for _, h := range info.Headers {
+		builder.AddHeaderDep(h)
+	}
 
 	lcWitness, err := psh.mkWitnessCoordinate(info.LCState, info.LCSigA, info.LCSigB, info.LCCoordSig)
 	if err != nil {

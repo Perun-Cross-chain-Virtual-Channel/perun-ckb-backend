@@ -18,9 +18,12 @@ type VcMergeInfo struct {
 	ParentParams1     *channel.Params
 	BlockNum0         uint64
 	BlockNum1         uint64
-	Header            types.Hash
-	VCTS              *types.Script
-	VCDispute         *molecule.VCDispute
+	// Headers must include the block headers of BOTH consumed VC cells, which the
+	// contract's check_valid_vc_merge reads via load_header(0/1, GroupInput) to
+	// pick the lower-block cell.
+	Headers   []types.Hash
+	VCTS      *types.Script
+	VCDispute *molecule.VCDispute
 
 	// RestoredOwnerScript0 / RestoredOwnerScript1 are the real payment scripts of the
 	// owners of VCStatus0 / VCStatus1, resolved from the on-chain owner records (see
@@ -40,7 +43,7 @@ func NewVCMergeInfo(
 	occupiedCapacity1 uint64,
 	blockNum0 uint64,
 	blockNum1 uint64,
-	header types.Hash,
+	headers []types.Hash,
 	vcts *types.Script,
 	vcDispute *molecule.VCDispute,
 	restoredOwnerScript0 *types.Script,
@@ -55,7 +58,7 @@ func NewVCMergeInfo(
 		OccupiedCapacity1:    occupiedCapacity1,
 		BlockNum0:            blockNum0,
 		BlockNum1:            blockNum1,
-		Header:               header,
+		Headers:              headers,
 		VCTS:                 vcts,
 		VCDispute:            vcDispute,
 		RestoredOwnerScript0: restoredOwnerScript0,

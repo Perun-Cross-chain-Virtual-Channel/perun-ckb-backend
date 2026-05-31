@@ -7,6 +7,8 @@ import (
 	"log"
 	"math"
 	"math/big"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/nervosnetwork/ckb-sdk-go/v2/address"
@@ -30,6 +32,31 @@ import (
 var ErrNoChannelLiveCell = errors.New("no channel live cell found")
 
 const SearchIndexerLimit = 1199
+
+// contentionRetries bounds how many times a state-mutating operation rebuilds
+// and resubmits after losing a race for its input cells. Between attempts we
+// re-read on-chain state, so a competing transaction that already achieved our
+// goal (or merely consumed our fee cell) is handled on the next pass.
+const contentionRetries = 6
+
+// contentionRetryDelay is the pause between contention retries, chosen to let a
+// competing tx get mined and the ckb-indexer catch up before we re-read.
+const contentionRetryDelay = time.Second
+
+// isCellContentionError reports whether err indicates the transaction lost a
+// race for its input cells (CKB has no per-account nonce): an under-priced RBF
+// rejection against a pending tx on the same cell, or an input already
+// spent/unknown because the competitor was mined first.
+func isCellContentionError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "PoolRejectedRBF") ||
+		strings.Contains(msg, "TransactionFailedToResolve") ||
+		strings.Contains(msg, "Dead(OutPoint") ||
+		strings.Contains(msg, "Unknown(OutPoint")
+}
 
 type BlockNumber = uint64
 
@@ -142,6 +169,12 @@ type Client struct {
 	psh     *transaction.PerunScriptHandler
 	cache   StableScriptCache
 	vccache StableScriptCache
+
+	// txMu serializes state-mutating operations on this client so two concurrent
+	// operations (e.g. a watcher goroutine racing the caller) don't select and
+	// spend the same fee/channel cells. Pointer so it stays shared across the
+	// value-receiver copies of Client.
+	txMu *sync.Mutex
 }
 
 func NewClient(rpcClient rpc.Client, signer backend.Signer, deployment backend.Deployment) (*Client, error) {
@@ -153,12 +186,15 @@ func NewClient(rpcClient rpc.Client, signer backend.Signer, deployment backend.D
 		psh:        psh,
 		cache:      NewStableScriptCache(),
 		vccache:    NewStableScriptCache(),
+		txMu:       &sync.Mutex{},
 	}, nil
 }
 
 var _ CKBClient = (*Client)(nil)
 
 func (c Client) Start(ctx context.Context, params *channel.Params, state *channel.State) (*types.Script, error) {
+	c.txMu.Lock()
+	defer c.txMu.Unlock()
 	// TODO: Override defaulthash logic.
 	log.Println("Start called")
 	iter, _, err := c.mkMyCKBCellIterator()
@@ -268,6 +304,32 @@ func (c Client) submitTx(ctx context.Context, tx *ckbtransaction.TransactionWith
 	return c.sendAndAwait(ctx, sTx)
 }
 
+// buildAndSubmitWithRetry rebuilds (re-selecting fresh fee cells) and resubmits
+// a transaction on cell-contention errors. For paths where only the fee cell is
+// contended; paths whose channel cell is contended re-read state per attempt
+// instead (see Dispute/DisputeVC/ForceClose).
+func (c Client) buildAndSubmitWithRetry(ctx context.Context, label string, build func() (*ckbtransaction.TransactionWithScriptGroups, error)) error {
+	for attempt := 0; ; attempt++ {
+		tx, err := build()
+		if err != nil {
+			return err
+		}
+		if err := c.submitTx(ctx, tx); err != nil {
+			if isCellContentionError(err) && attempt < contentionRetries-1 {
+				log.Printf("%s: cell contention (attempt %d), rebuilding: %v", label, attempt+1, err)
+				select {
+				case <-ctx.Done():
+					return ctx.Err()
+				case <-time.After(contentionRetryDelay):
+				}
+				continue
+			}
+			return err
+		}
+		return nil
+	}
+}
+
 // submitTxWithArgument submits a transaction whose type is determined by the
 // txTypeArgument.
 //
@@ -341,6 +403,8 @@ func (c Client) createOrGetChannelToken(ctx context.Context, iter collector.Cell
 }
 
 func (c Client) Fund(ctx context.Context, pcts *types.Script, state *channel.State, params *channel.Params) error {
+	c.txMu.Lock()
+	defer c.txMu.Unlock()
 	log.Println("Fund(ckbclient) called")
 	channelCell, err := c.getExactChannelLiveCell(ctx, pcts)
 	if err != nil {
@@ -373,19 +437,9 @@ func (c Client) Fund(ctx context.Context, pcts *types.Script, state *channel.Sta
 }
 
 func (c Client) Dispute(ctx context.Context, id channel.ID, state *channel.State, sigs []wallet.Sig, params *channel.Params) error {
+	c.txMu.Lock()
+	defer c.txMu.Unlock()
 	log.Println("Dispute called")
-	var di *transaction.DisputeInfo
-
-	channelCell, status, err := c.getChannelLiveCellWithCache(ctx, id)
-	if err != nil {
-		return fmt.Errorf("getting channel live cell: %w", err)
-	}
-	header, err := retryRPC(ctx, 3, 10*time.Second, func() (*types.Header, error) {
-		return c.client.GetTipHeader(ctx)
-	})
-	if err != nil {
-		return fmt.Errorf("getting tip header: %w", err)
-	}
 
 	if len(sigs) != 2 {
 		return fmt.Errorf("expected 2 signatures, got %d", len(sigs))
@@ -401,30 +455,62 @@ func (c Client) Dispute(ctx context.Context, id channel.ID, state *channel.State
 		return fmt.Errorf("encoding signature B: %w", err)
 	}
 
-	if !checkVersion(state, status, nil, nil) {
-		log.Println("Dispute not needed")
+	// Retry on cell contention, re-reading state each attempt: once a competitor's
+	// dispute lands checkVersion short-circuits to a no-op; a taken fee cell is
+	// resolved by rebuilding.
+	for attempt := 0; ; attempt++ {
+		channelCell, status, err := c.getChannelLiveCellWithCache(ctx, id)
+		if err != nil {
+			return fmt.Errorf("getting channel live cell: %w", err)
+		}
+
+		if !checkVersion(state, status, nil, nil) {
+			log.Println("Dispute not needed")
+			return nil
+		}
+
+		header, err := retryRPC(ctx, 3, 10*time.Second, func() (*types.Header, error) {
+			return c.client.GetTipHeader(ctx)
+		})
+		if err != nil {
+			return fmt.Errorf("getting tip header: %w", err)
+		}
+
+		di := transaction.NewDisputeInfo(*channelCell.OutPoint, *status, state, params, header.Hash, channelCell.Output.Type, *sigA, *sigB)
+		di.InputChannelCapacity = channelCell.Output.Capacity
+
+		builder, err := c.newPerunTransactionBuilder(nil)
+		if err != nil {
+			return fmt.Errorf("creating Perun transaction builder: %w", err)
+		}
+		if err := builder.Dispute(di); err != nil {
+			return fmt.Errorf("creating dispute transaction: %w", err)
+		}
+		tx, err := builder.Build(c.signer.Contexts())
+		if err != nil {
+			return fmt.Errorf("building dispute transaction: %w", err)
+		}
+		if err := c.submitTx(ctx, tx); err != nil {
+			if isCellContentionError(err) && attempt < contentionRetries-1 {
+				log.Printf("Dispute: cell contention (id=%x attempt %d), re-reading: %v", id[:4], attempt+1, err)
+				select {
+				case <-ctx.Done():
+					return ctx.Err()
+				case <-time.After(contentionRetryDelay):
+				}
+				continue
+			}
+			log.Printf("Dispute: submitTx failed (id=%x): %v", id[:4], err)
+			return err
+		}
+		log.Printf("Dispute: submitted+committed (id=%x ver=%d)", id[:4], state.Version)
 		return nil
 	}
-
-	di = transaction.NewDisputeInfo(*channelCell.OutPoint, *status, state, params, header.Hash, channelCell.Output.Type, *sigA, *sigB)
-	di.InputChannelCapacity = channelCell.Output.Capacity
-
-	builder, err := c.newPerunTransactionBuilder(nil)
-	if err != nil {
-		return fmt.Errorf("creating Perun transaction builder: %w", err)
-	}
-	if err := builder.Dispute(di); err != nil {
-		return fmt.Errorf("creating dispute transaction: %w", err)
-	}
-	tx, err := builder.Build(c.signer.Contexts())
-	if err != nil {
-		return fmt.Errorf("building dispute transaction: %w", err)
-	}
-	return c.submitTx(ctx, tx)
 }
 
 func (c Client) DisputeVC(ctx context.Context, vcID, parentID channel.ID, vcState, parentState *channel.State, vcParams, parentParams *channel.Params, vcSigs, parentSigs []wallet.Sig, indexMap []channel.Index) error {
-	var di *transaction.VcDisputeInfo
+	c.txMu.Lock()
+	defer c.txMu.Unlock()
 
 	header, err := retryRPC(ctx, 3, 10*time.Second, func() (*types.Header, error) {
 		return c.client.GetTipHeader(ctx)
@@ -519,145 +605,259 @@ func (c Client) DisputeVC(ctx context.Context, vcID, parentID channel.ID, vcStat
 		return fmt.Errorf("parent channel ID %s not found in params", parentID)
 	}
 
-	virtualChannelCells, vcStatuses, err := c.getVirtualChannelLiveCellWithCache(ctx, vcID)
-	if err != nil && err != ErrNoChannelLiveCell {
-		return fmt.Errorf("looking up virtual channel live cell: %w", err)
-	}
-
-	if virtualChannelCells == nil {
-		// First VC dispute.
-		parentCell, status, err := c.getChannelLiveCellWithCache(ctx, parentID)
-		if err != nil {
-			return fmt.Errorf("getting channel live cell: %w", err)
+	// Retry on cell contention: the VC cell is shared by both parents, so a
+	// concurrent dispute of either parent can consume it. Re-reading the VC cells
+	// each attempt also re-selects the Start/merge/progress branch.
+	for attempt := 0; ; attempt++ {
+		virtualChannelCells, vcStatuses, err := c.getVirtualChannelLiveCellWithCache(ctx, vcID)
+		if err != nil && err != ErrNoChannelLiveCell {
+			return fmt.Errorf("looking up virtual channel live cell: %w", err)
 		}
 
-		// Check parent
-		if parentState.Version < molecule2.UnpackUint64(status.State().Version()) {
-			return fmt.Errorf("parent state version is not up to date")
+		if len(virtualChannelCells) > 1 {
+			// Two VC cells (both parents disputed concurrently): merge them into
+			// one first, then re-loop to dispute this parent on the merged cell.
+			if err := c.mergeVirtualChannelCells(ctx, virtualChannelCells, vcStatuses, &vcDispute); err != nil {
+				if isCellContentionError(err) && attempt < contentionRetries-1 {
+					log.Printf("DisputeVC: merge contention (vc=%x attempt %d), re-reading: %v", vcID[:4], attempt+1, err)
+					select {
+					case <-ctx.Done():
+						return ctx.Err()
+					case <-time.After(contentionRetryDelay):
+					}
+					continue
+				}
+				return err
+			}
+			continue
 		}
 
-		// Construct the VC owner participant using the signer's ACTUAL lock
-		// script (not just the default sighash script derived from the pubkey).
-		// This ensures VC rent payouts go to the right script for omni-lock /
-		// EVMSigner participants, not to a default-sighash address they don't
-		// control.
-		signerPub := c.signer.PublicKey()
-		signerAddr := c.signer.Address()
-		signerParticipant := ckbaddress.NewParticipant(signerPub, signerAddr.Script, signerAddr.Script)
+		var di *transaction.VcDisputeInfo
+		if virtualChannelCells == nil {
+			// First VC dispute.
+			parentCell, status, err := c.getChannelLiveCellWithCache(ctx, parentID)
+			if err != nil {
+				return fmt.Errorf("getting channel live cell: %w", err)
+			}
 
-		di = transaction.NewVCDisputeInfo(
-			parentCell.OutPoint,
-			nil,
-			status,
-			nil,
-			vcState,
-			parentState,
-			vcParams,
-			header.Hash,
-			parentCell.Output.Type,
-			nil,
-			*parentSigA, *parentSigB,
-			&vcDispute,
-			&parentVec,
-			true,
-			signerParticipant,
-		)
-		di.InputChannelCapacity = parentCell.Output.Capacity
-	} else if len(virtualChannelCells) > 1 {
-		occupiedCapacity0 := virtualChannelCells[0].Output.OccupiedCapacity(virtualChannelCells[0].OutputData)
-		occupiedCapacity1 := virtualChannelCells[1].Output.OccupiedCapacity(virtualChannelCells[1].OutputData)
+			// Check parent
+			if parentState.Version < molecule2.UnpackUint64(status.State().Version()) {
+				return fmt.Errorf("parent state version is not up to date")
+			}
 
-		// Resolve both VC owners' real payment scripts from their on-chain owner records so
-		// the dropped cell's capacity is returned to the correct (possibly omni-lock) address.
-		omniCodeHash := c.deployment.OmniLockScript.CodeHash
-		restoredOwnerScript0, err := ckbaddress.RecoverOnChainPaymentScript(vcStatuses[0].Owner(), omniCodeHash)
-		if err != nil {
-			return fmt.Errorf("recovering virtual channel 0 owner script: %w", err)
+			// Construct the VC owner participant using the signer's ACTUAL lock
+			// script (not just the default sighash script derived from the pubkey).
+			// This ensures VC rent payouts go to the right script for omni-lock /
+			// EVMSigner participants, not to a default-sighash address they don't
+			// control.
+			signerPub := c.signer.PublicKey()
+			signerAddr := c.signer.Address()
+			signerParticipant := ckbaddress.NewParticipant(signerPub, signerAddr.Script, signerAddr.Script)
+
+			di = transaction.NewVCDisputeInfo(
+				parentCell.OutPoint,
+				nil,
+				status,
+				nil,
+				vcState,
+				parentState,
+				vcParams,
+				header.Hash,
+				parentCell.Output.Type,
+				nil,
+				*parentSigA, *parentSigB,
+				&vcDispute,
+				&parentVec,
+				true,
+				signerParticipant,
+			)
+			di.InputChannelCapacity = parentCell.Output.Capacity
+		} else { // Dispute Progress or update
+			parentCell, status, err := c.getChannelLiveCellWithCache(ctx, parentID)
+			if err != nil {
+				return fmt.Errorf("getting channel live cell: %w", err)
+			}
+
+			virtualChannelCell := virtualChannelCells[0]
+			vcStatus := vcStatuses[0]
+
+			// Check the states' version to determine if the dispute is needed.
+			if !checkVersion(parentState, status, vcState, vcStatus) {
+				log.Println("Dispute not needed")
+				return nil
+			}
+
+			di = transaction.NewVCDisputeInfo(
+				parentCell.OutPoint,
+				virtualChannelCell.OutPoint,
+				status,
+				vcStatus,
+				vcState,
+				parentState,
+				vcParams,
+				header.Hash,
+				parentCell.Output.Type,
+				virtualChannelCell.Output.Type,
+				*parentSigA, *parentSigB,
+				&vcDispute,
+				&parentVec,
+				false,
+				nil,
+			)
+			di.InputChannelCapacity = parentCell.Output.Capacity
 		}
-		restoredOwnerScript1, err := ckbaddress.RecoverOnChainPaymentScript(vcStatuses[1].Owner(), omniCodeHash)
-		if err != nil {
-			return fmt.Errorf("recovering virtual channel 1 owner script: %w", err)
-		}
 
-		// Merge two virtual channels into one.
-		mergeVCInfo := transaction.NewVCMergeInfo(
-			virtualChannelCells[0].OutPoint,
-			virtualChannelCells[1].OutPoint,
-			vcStatuses[0],
-			vcStatuses[1],
-			occupiedCapacity0,
-			occupiedCapacity1,
-			virtualChannelCells[0].BlockNumber,
-			virtualChannelCells[1].BlockNumber,
-			header.Hash,
-			virtualChannelCells[0].Output.Type,
-			&vcDispute,
-			restoredOwnerScript0,
-			restoredOwnerScript1,
-		)
 		builder, err := c.newPerunTransactionBuilder(nil)
 		if err != nil {
 			return fmt.Errorf("creating Perun transaction builder: %w", err)
 		}
-		if err := builder.MergeVC(mergeVCInfo); err != nil {
+		if err := builder.DisputeVC(di); err != nil {
 			return fmt.Errorf("creating dispute transaction: %w", err)
 		}
 		tx, err := builder.Build(c.signer.Contexts())
 		if err != nil {
 			return fmt.Errorf("building dispute transaction: %w", err)
 		}
-		return c.submitTx(ctx, tx)
-
-	} else { // Dispute Progress or update
-		parentCell, status, err := c.getChannelLiveCellWithCache(ctx, parentID)
-		if err != nil {
-			return fmt.Errorf("getting channel live cell: %w", err)
+		if err := c.submitTx(ctx, tx); err != nil {
+			if isCellContentionError(err) && attempt < contentionRetries-1 {
+				log.Printf("DisputeVC: cell contention (vc=%x attempt %d), re-reading: %v", vcID[:4], attempt+1, err)
+				select {
+				case <-ctx.Done():
+					return ctx.Err()
+				case <-time.After(contentionRetryDelay):
+				}
+				continue
+			}
+			return err
 		}
+		return nil
+	}
+}
 
-		virtualChannelCell := virtualChannelCells[0]
-		vcStatus := vcStatuses[0]
-
-		// Check the states' version to determine if the dispute is needed.
-		if !checkVersion(parentState, status, vcState, vcStatus) {
-			log.Println("Dispute not needed")
-			return nil
-		}
-
-		di = transaction.NewVCDisputeInfo(
-			parentCell.OutPoint,
-			virtualChannelCell.OutPoint,
-			status,
-			vcStatus,
-			vcState,
-			parentState,
-			vcParams,
-			header.Hash,
-			parentCell.Output.Type,
-			virtualChannelCell.Output.Type,
-			*parentSigA, *parentSigB,
-			&vcDispute,
-			&parentVec,
-			false,
-			nil,
-		)
-		di.InputChannelCapacity = parentCell.Output.Capacity
+// mergeVirtualChannelCells consolidates the two VC cells that arise when a
+// virtual channel's two parents are disputed concurrently into one. The
+// contract detects the merge structurally (2 VC inputs, 1 output) and reads
+// both cells' block headers (load_header(0/1, GroupInput)) to keep the
+// lower-block cell, so both block hashes are supplied as header deps.
+func (c Client) mergeVirtualChannelCells(ctx context.Context, vcCells []*indexer.LiveCell, vcStatuses []*molecule.VirtualChannelStatus, vcDispute *molecule.VCDispute) error {
+	if len(vcCells) < 2 {
+		return fmt.Errorf("mergeVirtualChannelCells requires 2 VC cells, got %d", len(vcCells))
 	}
 
+	occupiedCapacity0 := vcCells[0].Output.OccupiedCapacity(vcCells[0].OutputData)
+	occupiedCapacity1 := vcCells[1].Output.OccupiedCapacity(vcCells[1].OutputData)
+
+	// Resolve both VC owners' real payment scripts from their on-chain owner
+	// records so the dropped cell's capacity is returned to the correct
+	// (possibly omni-lock) address.
+	omniCodeHash := c.deployment.OmniLockScript.CodeHash
+	restoredOwnerScript0, err := ckbaddress.RecoverOnChainPaymentScript(vcStatuses[0].Owner(), omniCodeHash)
+	if err != nil {
+		return fmt.Errorf("recovering virtual channel 0 owner script: %w", err)
+	}
+	restoredOwnerScript1, err := ckbaddress.RecoverOnChainPaymentScript(vcStatuses[1].Owner(), omniCodeHash)
+	if err != nil {
+		return fmt.Errorf("recovering virtual channel 1 owner script: %w", err)
+	}
+
+	blockHash0, err := c.blockHashOfCell(ctx, vcCells[0])
+	if err != nil {
+		return fmt.Errorf("getting vc cell 0 block hash: %w", err)
+	}
+	blockHash1, err := c.blockHashOfCell(ctx, vcCells[1])
+	if err != nil {
+		return fmt.Errorf("getting vc cell 1 block hash: %w", err)
+	}
+
+	mergeVCInfo := transaction.NewVCMergeInfo(
+		vcCells[0].OutPoint,
+		vcCells[1].OutPoint,
+		vcStatuses[0],
+		vcStatuses[1],
+		occupiedCapacity0,
+		occupiedCapacity1,
+		vcCells[0].BlockNumber,
+		vcCells[1].BlockNumber,
+		[]types.Hash{*blockHash0, *blockHash1},
+		vcCells[0].Output.Type,
+		vcDispute,
+		restoredOwnerScript0,
+		restoredOwnerScript1,
+	)
 	builder, err := c.newPerunTransactionBuilder(nil)
 	if err != nil {
 		return fmt.Errorf("creating Perun transaction builder: %w", err)
 	}
-	if err := builder.DisputeVC(di); err != nil {
-		return fmt.Errorf("creating dispute transaction: %w", err)
+	if err := builder.MergeVC(mergeVCInfo); err != nil {
+		return fmt.Errorf("creating vc merge transaction: %w", err)
 	}
 	tx, err := builder.Build(c.signer.Contexts())
 	if err != nil {
-		return fmt.Errorf("building dispute transaction: %w", err)
+		return fmt.Errorf("building vc merge transaction: %w", err)
 	}
 	return c.submitTx(ctx, tx)
 }
 
+// blockHashOfCell returns the hash of the block in which the given live cell's
+// producing transaction was included.
+func (c Client) blockHashOfCell(ctx context.Context, cell *indexer.LiveCell) (*types.Hash, error) {
+	tx, err := retryRPC(ctx, 3, 10*time.Second, func() (*types.TransactionWithStatus, error) {
+		return c.client.GetTransaction(ctx, cell.OutPoint.TxHash)
+	})
+	if err != nil {
+		return nil, err
+	}
+	if tx.TxStatus.BlockHash == nil {
+		return nil, fmt.Errorf("transaction %s has no block hash", cell.OutPoint.TxHash)
+	}
+	return tx.TxStatus.BlockHash, nil
+}
+
+// blockTimestamp returns the timestamp (CKB block time, in milliseconds) of the
+// block identified by blockHash.
+func (c Client) blockTimestamp(ctx context.Context, blockHash types.Hash) (uint64, error) {
+	header, err := retryRPC(ctx, 3, 10*time.Second, func() (*types.Header, error) {
+		return c.client.GetHeader(ctx, blockHash)
+	})
+	if err != nil {
+		return 0, err
+	}
+	return header.Timestamp, nil
+}
+
+// waitForTimeLockExpired polls the chain tip until the newest block timestamp
+// is at or past the largest supplied deadline, then returns that tip header.
+// The contract's verify_time_lock_expired compares a dispute block's timestamp
+// + challenge against the newest header dep, which lags wall-clock; without this
+// the attached tip can be behind the deadline and trip TimeLockNotExpired (69).
+func (c Client) waitForTimeLockExpired(ctx context.Context, deadlines ...uint64) (*types.Header, error) {
+	var deadline uint64
+	for _, d := range deadlines {
+		if d > deadline {
+			deadline = d
+		}
+	}
+	for {
+		header, err := retryRPC(ctx, 3, 10*time.Second, func() (*types.Header, error) {
+			return c.client.GetTipHeader(ctx)
+		})
+		if err != nil {
+			return nil, fmt.Errorf("getting tip header: %w", err)
+		}
+		if header.Timestamp >= deadline {
+			return header, nil
+		}
+		select {
+		case <-ctx.Done():
+			return nil, fmt.Errorf("waiting for time-lock (deadline %d ms, tip %d ms): %w", deadline, header.Timestamp, ctx.Err())
+		case <-time.After(200 * time.Millisecond):
+		}
+	}
+}
+
 func (c Client) Coordinate(ctx context.Context, id channel.ID, canonicalState *channel.State, sigs []wallet.Sig, coordSig wallet.Sig, params *channel.Params) error {
+	c.txMu.Lock()
+	defer c.txMu.Unlock()
 	log.Println("Coordinate called")
 	if len(sigs) != 2 {
 		return fmt.Errorf("expected 2 participant signatures, got %d", len(sigs))
@@ -675,11 +875,26 @@ func (c Client) Coordinate(ctx context.Context, id channel.ID, canonicalState *c
 		return fmt.Errorf("canonical state version %d is below on-chain version %d", canonicalState.Version, onChainVersion)
 	}
 
-	header, err := retryRPC(ctx, 3, 10*time.Second, func() (*types.Header, error) {
-		return c.client.GetTipHeader(ctx)
+	// The contract's verify_time_lock_expired loads the channel input cell's
+	// block header via load_header(0, GroupInput), so that block hash must be a
+	// header dep alongside the tip header (mirrors ForceClose).
+	oldTx, err := retryRPC(ctx, 3, 10*time.Second, func() (*types.TransactionWithStatus, error) {
+		return c.client.GetTransaction(ctx, channelCell.OutPoint.TxHash)
 	})
 	if err != nil {
-		return fmt.Errorf("getting tip header: %w", err)
+		return fmt.Errorf("getting channel cell transaction: %w", err)
+	}
+	blockHash := oldTx.TxStatus.BlockHash
+
+	// Wait until the chain tip is past the dispute deadline before attaching it,
+	// so verify_time_lock_expired sees current_time >= old_timestamp + challenge.
+	disputeTime, err := c.blockTimestamp(ctx, *blockHash)
+	if err != nil {
+		return fmt.Errorf("getting dispute block timestamp: %w", err)
+	}
+	header, err := c.waitForTimeLockExpired(ctx, disputeTime+params.ChallengeDuration)
+	if err != nil {
+		return fmt.Errorf("waiting for channel time-lock to expire: %w", err)
 	}
 
 	ci := transaction.NewCoordinateInfo(
@@ -687,27 +902,31 @@ func (c Client) Coordinate(ctx context.Context, id channel.ID, canonicalState *c
 		*status,
 		canonicalState,
 		params,
-		header.Hash,
+		[]types.Hash{*blockHash, header.Hash},
 		channelCell.Output.Type,
 		sigs[0], sigs[1], coordSig,
 		channelCell.Output.Capacity,
 	)
 
-	builder, err := c.newPerunTransactionBuilder(nil)
-	if err != nil {
-		return fmt.Errorf("creating Perun transaction builder: %w", err)
-	}
-	if err := builder.Coordinate(ci); err != nil {
-		return fmt.Errorf("creating coordinate transaction: %w", err)
-	}
-	tx, err := builder.Build(c.signer.Contexts())
-	if err != nil {
-		return fmt.Errorf("building coordinate transaction: %w", err)
-	}
-	return c.submitTx(ctx, tx)
+	return c.buildAndSubmitWithRetry(ctx, "Coordinate", func() (*ckbtransaction.TransactionWithScriptGroups, error) {
+		builder, err := c.newPerunTransactionBuilder(nil)
+		if err != nil {
+			return nil, fmt.Errorf("creating Perun transaction builder: %w", err)
+		}
+		if err := builder.Coordinate(ci); err != nil {
+			return nil, fmt.Errorf("creating coordinate transaction: %w", err)
+		}
+		tx, err := builder.Build(c.signer.Contexts())
+		if err != nil {
+			return nil, fmt.Errorf("building coordinate transaction: %w", err)
+		}
+		return tx, nil
+	})
 }
 
 func (c Client) CoordinateVC(ctx context.Context, parentID, vcID channel.ID, parentState, vcState *channel.State, parentSigs, vcSigs []wallet.Sig, parentCoordSig, vcCoordSig wallet.Sig, parentParams, vcParams *channel.Params) error {
+	c.txMu.Lock()
+	defer c.txMu.Unlock()
 	log.Println("CoordinateVC called")
 	if len(parentSigs) != 2 || len(vcSigs) != 2 {
 		return fmt.Errorf("expected 2 participant signatures per channel, got parent=%d vc=%d", len(parentSigs), len(vcSigs))
@@ -724,9 +943,40 @@ func (c Client) CoordinateVC(ctx context.Context, parentID, vcID channel.ID, par
 		return fmt.Errorf("canonical parent state version %d below on-chain %d", parentState.Version, onV)
 	}
 
-	vcCells, vcStatuses, err := c.getVirtualChannelLiveCellWithCache(ctx, vcID)
+	vcCells, vcStatuses, err := c.getAllVirtualChannelLiveCellsForID(ctx, vcID)
 	if err != nil {
 		return fmt.Errorf("getting virtual channel live cell: %w", err)
+	}
+	if len(vcCells) > 1 {
+		// The VC's two parents were disputed concurrently, leaving two cells
+		// (same vcts, different blocks). Merge them into one BEFORE coordinating
+		// either: once a cell is coordinated, the two statuses diverge and the
+		// contract's verify_equal_vc_status would reject the merge. The merge
+		// ignores the witness sigs but needs a structurally valid VCDispute.
+		vcSigA, err := encodeOptionalSignature(vcSigs[0])
+		if err != nil {
+			return fmt.Errorf("encoding vc signature A for merge: %w", err)
+		}
+		vcSigB, err := encodeOptionalSignature(vcSigs[1])
+		if err != nil {
+			return fmt.Errorf("encoding vc signature B for merge: %w", err)
+		}
+		parentSigAEnc, err := encodeOptionalSignature(parentSigs[0])
+		if err != nil {
+			return fmt.Errorf("encoding parent signature A for merge: %w", err)
+		}
+		parentSigBEnc, err := encodeOptionalSignature(parentSigs[1])
+		if err != nil {
+			return fmt.Errorf("encoding parent signature B for merge: %w", err)
+		}
+		vcDispute := encoding.PackVCDispute(vcSigA, vcSigB, parentSigAEnc, parentSigBEnc)
+		if err := c.mergeVirtualChannelCells(ctx, vcCells, vcStatuses, &vcDispute); err != nil {
+			return fmt.Errorf("merging split virtual channel before coordinate: %w", err)
+		}
+		vcCells, vcStatuses, err = c.getAllVirtualChannelLiveCellsForID(ctx, vcID)
+		if err != nil {
+			return fmt.Errorf("getting virtual channel live cell after merge: %w", err)
+		}
 	}
 	if len(vcCells) != 1 {
 		return fmt.Errorf("CoordinateVC requires exactly one VC cell, got %d", len(vcCells))
@@ -737,11 +987,41 @@ func (c Client) CoordinateVC(ctx context.Context, parentID, vcID channel.ID, par
 		return fmt.Errorf("canonical vc state version %d below on-chain %d", vcState.Version, onV)
 	}
 
-	header, err := retryRPC(ctx, 3, 10*time.Second, func() (*types.Header, error) {
-		return c.client.GetTipHeader(ctx)
+	// The contract's verify_time_lock_expired loads each group input's block
+	// header via load_header(0, GroupInput): PCTS reads the parent channel cell,
+	// VCTS reads the VC cell. Both block hashes must be header deps alongside the
+	// tip header (find_closest_current_time). Mirrors Coordinate.
+	parentTx, err := retryRPC(ctx, 3, 10*time.Second, func() (*types.TransactionWithStatus, error) {
+		return c.client.GetTransaction(ctx, parentCell.OutPoint.TxHash)
 	})
 	if err != nil {
-		return fmt.Errorf("getting tip header: %w", err)
+		return fmt.Errorf("getting parent channel cell transaction: %w", err)
+	}
+	vcTx, err := retryRPC(ctx, 3, 10*time.Second, func() (*types.TransactionWithStatus, error) {
+		return c.client.GetTransaction(ctx, vcCell.OutPoint.TxHash)
+	})
+	if err != nil {
+		return fmt.Errorf("getting vc cell transaction: %w", err)
+	}
+
+	// Wait past every enforced deadline: the parent's window always, plus the
+	// VC's own window only on the first coordinate (the VCTS skips it once
+	// old_vc_status.coordinated() is true, i.e. the second parent's coordinate).
+	parentDisputeTime, err := c.blockTimestamp(ctx, *parentTx.TxStatus.BlockHash)
+	if err != nil {
+		return fmt.Errorf("getting parent dispute block timestamp: %w", err)
+	}
+	deadlines := []uint64{parentDisputeTime + parentParams.ChallengeDuration}
+	if !encoding.ToBool(*vcStatus.Coordinated()) {
+		vcDisputeTime, err := c.blockTimestamp(ctx, *vcTx.TxStatus.BlockHash)
+		if err != nil {
+			return fmt.Errorf("getting vc dispute block timestamp: %w", err)
+		}
+		deadlines = append(deadlines, vcDisputeTime+vcParams.ChallengeDuration)
+	}
+	header, err := c.waitForTimeLockExpired(ctx, deadlines...)
+	if err != nil {
+		return fmt.Errorf("waiting for vc/parent time-locks to expire: %w", err)
 	}
 
 	ci := &transaction.VCCoordinateInfo{
@@ -757,28 +1037,32 @@ func (c Client) CoordinateVC(ctx context.Context, parentID, vcID channel.ID, par
 		VCSigA:               vcSigs[0],
 		VCSigB:               vcSigs[1],
 		VCCoordSig:           vcCoordSig,
-		Header:               header.Hash,
+		Headers:              []types.Hash{*parentTx.TxStatus.BlockHash, *vcTx.TxStatus.BlockHash, header.Hash},
 		PCTS:                 parentCell.Output.Type,
 		VCTS:                 vcCell.Output.Type,
 		InputChannelCapacity: parentCell.Output.Capacity,
 		InputVCCapacity:      vcCell.Output.Capacity,
 	}
 
-	builder, err := c.newPerunTransactionBuilder(nil)
-	if err != nil {
-		return fmt.Errorf("creating Perun transaction builder: %w", err)
-	}
-	if err := builder.CoordinateVC(ci); err != nil {
-		return fmt.Errorf("creating vc coordinate transaction: %w", err)
-	}
-	tx, err := builder.Build(c.signer.Contexts())
-	if err != nil {
-		return fmt.Errorf("building vc coordinate transaction: %w", err)
-	}
-	return c.submitTx(ctx, tx)
+	return c.buildAndSubmitWithRetry(ctx, "CoordinateVC", func() (*ckbtransaction.TransactionWithScriptGroups, error) {
+		builder, err := c.newPerunTransactionBuilder(nil)
+		if err != nil {
+			return nil, fmt.Errorf("creating Perun transaction builder: %w", err)
+		}
+		if err := builder.CoordinateVC(ci); err != nil {
+			return nil, fmt.Errorf("creating vc coordinate transaction: %w", err)
+		}
+		tx, err := builder.Build(c.signer.Contexts())
+		if err != nil {
+			return nil, fmt.Errorf("building vc coordinate transaction: %w", err)
+		}
+		return tx, nil
+	})
 }
 
 func (c Client) Close(ctx context.Context, id channel.ID, state *channel.State, sigs []wallet.Sig, params *channel.Params) error {
+	c.txMu.Lock()
+	defer c.txMu.Unlock()
 	log.Println("Close called")
 	channelCell, _, err := c.getChannelLiveCellWithCache(ctx, id)
 	if err != nil {
@@ -856,56 +1140,111 @@ func (c Client) getAssets(ctx context.Context, pcts *types.Script) (*indexer.Liv
 }
 
 func (c Client) ForceClose(ctx context.Context, id channel.ID, state *channel.State, params *channel.Params) error {
+	c.txMu.Lock()
+	defer c.txMu.Unlock()
 	log.Println("ForceClose called")
-	channelCell, _, err := c.getChannelLiveCellWithCache(ctx, id)
-	if err != nil {
-		return fmt.Errorf("getting channel live cell: %w", err)
-	}
-	pcts := channelCell.Output.Type
-	assets, err := c.getAssets(ctx, pcts)
-	if err != nil {
-		return fmt.Errorf("retrieving assets locked in channel: %w", err)
-	}
-	header, err := retryRPC(ctx, 3, 10*time.Second, func() (*types.Header, error) {
-		return c.client.GetTipHeader(ctx)
-	})
-	if err != nil {
-		return fmt.Errorf("getting tip header: %w", err)
-	}
+	// Retry on cell contention: both parties Settle the same channel, so re-read
+	// each attempt — once the competitor's force close concludes it, the lookup
+	// returns ErrNoChannelLiveCell, handled below as an idempotent success.
+	for attempt := 0; ; attempt++ {
+		channelCell, _, err := c.getChannelLiveCellWithCache(ctx, id)
+		if errors.Is(err, ErrNoChannelLiveCell) {
+			// Normal (non-VC) force close pays BOTH parties and consumes the channel
+			// cell in a single transaction (see the contract's check_normal_force_close
+			// -> verify_all_paid). When both parties Settle(secondary=false) — as the
+			// multi-ledger harness does — the second force close legitimately finds no
+			// channel cell: the channel is already concluded and both payouts landed.
+			// Treat that as success (matching the eth-backend, whose Withdraw skips an
+			// already-concluded channel). NOTE: this is the LEDGER-channel path; the
+			// genuine first/second force-close distinction only applies to virtual
+			// channels and is handled separately by ForceCloseWithVC.
+			log.Printf("ForceClose: channel %x already concluded (both parties paid by the first force close)", id[:4])
+			return nil
+		}
+		if err != nil {
+			return fmt.Errorf("getting channel live cell: %w", err)
+		}
+		pcts := channelCell.Output.Type
+		assets, err := c.getAssets(ctx, pcts)
+		if err != nil {
+			return fmt.Errorf("retrieving assets locked in channel: %w", err)
+		}
+		header, err := retryRPC(ctx, 3, 10*time.Second, func() (*types.Header, error) {
+			return c.client.GetTipHeader(ctx)
+		})
+		if err != nil {
+			return fmt.Errorf("getting tip header: %w", err)
+		}
 
-	oldTx, err := retryRPC(ctx, 3, 10*time.Second, func() (*types.TransactionWithStatus, error) {
-		return c.client.GetTransaction(ctx, channelCell.OutPoint.TxHash)
-	})
-	if err != nil {
-		return fmt.Errorf("getting old transaction: %w", err)
-	}
-	blockHash := oldTx.TxStatus.BlockHash
+		oldTx, err := retryRPC(ctx, 3, 10*time.Second, func() (*types.TransactionWithStatus, error) {
+			return c.client.GetTransaction(ctx, channelCell.OutPoint.TxHash)
+		})
+		if err != nil {
+			return fmt.Errorf("getting old transaction: %w", err)
+		}
+		blockHash := oldTx.TxStatus.BlockHash
 
-	channelCapacity := channelCell.Output.Capacity
-	fci := transaction.NewForceCloseInfo(
-		types.CellInput{PreviousOutput: channelCell.OutPoint},
-		mkCellInputs(assets),
-		[]types.Hash{*blockHash, header.Hash},
-		state,
-		params,
-		channelCapacity,
-	)
+		channelCapacity := channelCell.Output.Capacity
+		fci := transaction.NewForceCloseInfo(
+			types.CellInput{PreviousOutput: channelCell.OutPoint},
+			mkCellInputs(assets),
+			[]types.Hash{*blockHash, header.Hash},
+			state,
+			params,
+			channelCapacity,
+		)
 
-	builder, err := c.newPerunTransactionBuilder(nil)
-	if err != nil {
-		return fmt.Errorf("creating Perun transaction builder: %w", err)
+		builder, err := c.newPerunTransactionBuilder(nil)
+		if err != nil {
+			return fmt.Errorf("creating Perun transaction builder: %w", err)
+		}
+		if err := builder.ForceClose(fci); err != nil {
+			return fmt.Errorf("creating force close transaction: %w", err)
+		}
+		tx, err := builder.Build(c.signer.Contexts())
+		if err != nil {
+			return fmt.Errorf("building force close transaction: %w", err)
+		}
+		if err := c.submitTx(ctx, tx); err != nil {
+			if isCellContentionError(err) && attempt < contentionRetries-1 {
+				log.Printf("ForceClose: cell contention (id=%x attempt %d), re-reading: %v", id[:4], attempt+1, err)
+				select {
+				case <-ctx.Done():
+					return ctx.Err()
+				case <-time.After(contentionRetryDelay):
+				}
+				continue
+			}
+			return err
+		}
+		return nil
 	}
-	if err := builder.ForceClose(fci); err != nil {
-		return fmt.Errorf("creating force close transaction: %w", err)
+}
+
+// encodeOptionalSignature converts a participant signature to the molecule
+// representation, returning an empty Bytes for a nil/empty signature. Used on
+// witness positions the contract does not verify (e.g. the VC force-close
+// path), where a coordinated transaction's reset sigs would otherwise abort the
+// call before tx construction.
+func encodeOptionalSignature(sig wallet.Sig) (*molecule.Bytes, error) {
+	if len(sig) == 0 {
+		empty := molecule.BytesDefault()
+		return &empty, nil
 	}
-	tx, err := builder.Build(c.signer.Contexts())
-	if err != nil {
-		return fmt.Errorf("building force close transaction: %w", err)
-	}
-	return c.submitTx(ctx, tx)
+	return encoding.NewMoleculeSignature(sig)
 }
 
 func (c Client) ForceCloseWithVC(ctx context.Context, id channel.ID, vcid channel.ID, state *channel.State, vcstate *channel.State, sigs []wallet.Sig, params *channel.Params, indexMap []channel.Index) error {
+	c.txMu.Lock()
+	defer c.txMu.Unlock()
+	// Clone the caller's states: updateState (below, on the "old versions"
+	// branch) reassigns balance rows in place, which would otherwise mutate the
+	// channel-machine's state objects shared by reference with the test harness's
+	// balance config and corrupt later assertions. A client must not mutate
+	// caller-owned state.
+	state = state.Clone()
+	vcstate = vcstate.Clone()
+
 	virtualChannelCells, vcStatuses, err := c.getVirtualChannelLiveCellWithCache(ctx, vcid)
 	if err != nil {
 		return fmt.Errorf("getting virtual channel live cell: %w", err)
@@ -937,22 +1276,23 @@ func (c Client) ForceCloseWithVC(ctx context.Context, id channel.ID, vcid channe
 		return fmt.Errorf("retrieving assets locked in channel: %w", err)
 	}
 
-	sigA, err := encoding.NewMoleculeSignature(sigs[0])
+	// The participant signatures are vestigial on the VC force-close path: the
+	// contract's check_vc_force_close performs no signature verification (the LC
+	// is settled via its coordinated flag or its own time lock, and the witness
+	// is the empty ForceClose default — see buildFirstForceCloseWithVCTransaction).
+	// They are still required and verified on the dispute path that produced them.
+	// After a Coordinate, however, the machine's coordinated transaction carries
+	// nil sigs (machine.forceState resets them), so tolerate empty sigs here.
+	sigA, err := encodeOptionalSignature(sigs[0])
 	if err != nil {
 		return fmt.Errorf("encoding signature A: %w", err)
 	}
 
-	sigB, err := encoding.NewMoleculeSignature(sigs[1])
+	sigB, err := encodeOptionalSignature(sigs[1])
 	if err != nil {
 		return fmt.Errorf("encoding signature B: %w", err)
 	}
 
-	header, err := retryRPC(ctx, 3, 10*time.Second, func() (*types.Header, error) {
-		return c.client.GetTipHeader(ctx)
-	})
-	if err != nil {
-		return fmt.Errorf("getting tip header: %w", err)
-	}
 	oldTx, err := retryRPC(ctx, 3, 10*time.Second, func() (*types.TransactionWithStatus, error) {
 		return c.client.GetTransaction(ctx, channelCell.OutPoint.TxHash)
 	})
@@ -960,6 +1300,32 @@ func (c Client) ForceCloseWithVC(ctx context.Context, id channel.ID, vcid channe
 		return fmt.Errorf("getting old transaction: %w", err)
 	}
 	blockHash := oldTx.TxStatus.BlockHash
+
+	// Wait past both dispute deadlines (the parent and VC cells may sit in
+	// different blocks). check_vc_force_close checks the parent's window with
+	// params.challenge_duration and the VC's window with the VC's OWN
+	// vcts_args.params().challenge_duration, which may differ.
+	parentDisputeTime, err := c.blockTimestamp(ctx, *blockHash)
+	if err != nil {
+		return fmt.Errorf("getting parent dispute block timestamp: %w", err)
+	}
+	vcBlockHash, err := c.blockHashOfCell(ctx, virtualChannelCell)
+	if err != nil {
+		return fmt.Errorf("getting vc cell block hash: %w", err)
+	}
+	vcDisputeTime, err := c.blockTimestamp(ctx, *vcBlockHash)
+	if err != nil {
+		return fmt.Errorf("getting vc dispute block timestamp: %w", err)
+	}
+	vcConstants, err := molecule.VCChannelConstantsFromSlice(vcts.Args, false)
+	if err != nil {
+		return fmt.Errorf("decoding vc channel constants: %w", err)
+	}
+	vcChallenge := molecule2.UnpackUint64(vcConstants.Params().ChallengeDuration())
+	header, err := c.waitForTimeLockExpired(ctx, parentDisputeTime+params.ChallengeDuration, vcDisputeTime+vcChallenge)
+	if err != nil {
+		return fmt.Errorf("waiting for force-close time-locks to expire: %w", err)
+	}
 
 	// Check version.
 	if !checkVersion(state, status, vcstate, vcStatus) {
@@ -994,7 +1360,10 @@ func (c Client) ForceCloseWithVC(ctx context.Context, id channel.ID, vcid channe
 		vcStatus,
 		*sigA, *sigB,
 		params,
-		[]types.Hash{header.Hash, *blockHash},
+		// Header deps: tip, the parent cell's block (PCTS load_header), and the VC
+		// cell's block (VCTS load_header). All three are required since the parent
+		// and VC cells can be in different blocks.
+		[]types.Hash{header.Hash, *blockHash, *vcBlockHash},
 		mkCellInputs(assets),
 		channelCapacity,
 		occupiedVirtualChannelCapacity,
@@ -1019,6 +1388,8 @@ func (c Client) ForceCloseWithVC(ctx context.Context, id channel.ID, vcid channe
 }
 
 func (c Client) Abort(ctx context.Context, script *types.Script, params *channel.Params, state *channel.State) error {
+	c.txMu.Lock()
+	defer c.txMu.Unlock()
 	channelCell, err := c.getExactChannelLiveCell(ctx, script)
 	if err != nil {
 		return fmt.Errorf("getting channel live cell: %w", err)
@@ -1062,10 +1433,12 @@ func (c Client) Abort(ctx context.Context, script *types.Script, params *channel
 func (c Client) GetChannelWithExactPCTS(ctx context.Context, pcts *types.Script) (BlockNumber, *molecule.ChannelStatus, error) {
 	cell, err := c.getExactChannelLiveCell(ctx, pcts)
 	if err != nil {
+		log.Printf("GetChannelWithExactPCTS: getExactChannelLiveCell err: %v", err)
 		return 0, nil, fmt.Errorf("getting exact channel live cell: %w", err)
 	}
 	channelStatus, err := molecule.ChannelStatusFromSlice(cell.OutputData, false)
 	if err != nil {
+		log.Printf("GetChannelWithExactPCTS: ChannelStatusFromSlice err: %v (data len=%d)", err, len(cell.OutputData))
 		return 0, nil, err
 	}
 	return cell.BlockNumber, channelStatus, nil
@@ -1108,8 +1481,48 @@ func (c Client) sendAndAwait(ctx context.Context, tx *types.Transaction) error {
 			}
 		}
 	}
+	ticker.Stop()
+
+	// The tx is committed on the node, but the ckb-indexer (which powers every
+	// live-cell lookup and the fee-cell collector) trails it. Block until the
+	// indexer reaches the committing block, else a follow-up tx could pick a cell
+	// the indexer still lists as live but the node already spent.
+	if txWithStatus.TxStatus.BlockHash != nil {
+		committedHeader, err := retryRPC(ctx, 3, 10*time.Second, func() (*types.Header, error) {
+			return c.client.GetHeader(ctx, *txWithStatus.TxStatus.BlockHash)
+		})
+		if err != nil {
+			return fmt.Errorf("getting committing block header: %w", err)
+		}
+		if err := c.waitForIndexer(ctx, committedHeader.Number); err != nil {
+			return fmt.Errorf("waiting for indexer to sync: %w", err)
+		}
+	}
 
 	return nil
+}
+
+// waitForIndexer blocks until the ckb-indexer has processed at least up to the
+// given block number. The indexer trails the node, so live-cell queries issued
+// immediately after a tx commits can otherwise return cells that are already
+// spent (or miss freshly created ones).
+func (c Client) waitForIndexer(ctx context.Context, blockNumber uint64) error {
+	for {
+		tip, err := retryRPC(ctx, 3, 10*time.Second, func() (*indexer.TipHeader, error) {
+			return c.client.GetIndexerTip(ctx)
+		})
+		if err != nil {
+			return fmt.Errorf("getting indexer tip: %w", err)
+		}
+		if tip != nil && tip.BlockNumber >= blockNumber {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(200 * time.Millisecond):
+		}
+	}
 }
 
 func (c Client) GetChannelWithID(ctx context.Context, id channel.ID) (BlockNumber, *types.Script, *molecule.ChannelConstants, *molecule.ChannelStatus, error) {
@@ -1215,6 +1628,41 @@ func (c Client) getExactChannelLiveCell(ctx context.Context, pcts *types.Script)
 		return nil, ErrNoChannelLiveCell
 	}
 	return cells.Objects[0], nil
+}
+
+// getAllVirtualChannelLiveCellsForID returns every live VC cell sharing the
+// virtual channel's vcts — up to two, when the channel's two parents disputed
+// concurrently. Unlike getVirtualChannelLiveCellWithCache, it does not truncate
+// to the first match on a cache miss, so CoordinateVC can detect (and merge) a
+// split VC before coordinating either cell.
+func (c Client) getAllVirtualChannelLiveCellsForID(ctx context.Context, id channel.ID) ([]*indexer.LiveCell, []*molecule.VirtualChannelStatus, error) {
+	script, cached := c.vccache.Get(id)
+	if !cached {
+		liveCells, err := c.getAllVirtualChannelLiveCells(ctx)
+		if err != nil {
+			return nil, nil, err
+		}
+		cell, _, err := c.getFirstVirtualChannelLiveCellWithID(liveCells, id)
+		if err != nil {
+			return nil, nil, err
+		}
+		script = cell.Output.Type
+		// Best-effort cache; the resolved script is used regardless.
+		_ = c.vccache.Set(id, script)
+	}
+	cells, err := c.getExactVirtualChannelLiveCell(ctx, script)
+	if err != nil {
+		return nil, nil, err
+	}
+	statuses := make([]*molecule.VirtualChannelStatus, len(cells))
+	for i, cell := range cells {
+		status, err := molecule.VirtualChannelStatusFromSlice(cell.OutputData, false)
+		if err != nil {
+			return nil, nil, fmt.Errorf("converting cell outputdata to VirtualChannelStatus: %w", err)
+		}
+		statuses[i] = status
+	}
+	return cells, statuses, nil
 }
 
 func (c Client) getExactVirtualChannelLiveCell(ctx context.Context, vcts *types.Script) ([]*indexer.LiveCell, error) {
