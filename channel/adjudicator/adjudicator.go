@@ -7,14 +7,25 @@ import (
 	"github.com/pkg/errors"
 	"perun.network/go-perun/channel"
 	"perun.network/perun-ckb-backend/client"
+	"perun.network/perun-ckb-backend/encoding"
 )
 
 type Adjudicator struct {
-	client client.CKBClient
+	client       client.CKBClient
+	assetFactory encoding.AssetFactory
 }
 
 func NewAdjudicator(client client.CKBClient) *Adjudicator {
 	return &Adjudicator{client: client}
+}
+
+// NewAdjudicatorWithAssetFactory is like NewAdjudicator but injects an
+// AssetFactory into the polling subscription emitted by Subscribe. The factory
+// controls how the CoordinatedEvent state is reconstructed from the on-chain
+// molecule encoding (needed for multi-ledger harnesses where assets must match
+// the originals). nil falls back to encoding.DefaultAssetFactory.
+func NewAdjudicatorWithAssetFactory(client client.CKBClient, factory encoding.AssetFactory) *Adjudicator {
+	return &Adjudicator{client: client, assetFactory: factory}
 }
 
 func (a Adjudicator) Register(ctx context.Context, req channel.AdjudicatorReq, states []channel.SignedState) error {
@@ -64,5 +75,5 @@ func (a Adjudicator) Progress(ctx context.Context, req channel.ProgressReq) erro
 }
 
 func (a Adjudicator) Subscribe(ctx context.Context, id channel.ID) (channel.AdjudicatorSubscription, error) {
-	return NewAdjudicatorSubFromChannelID(ctx, a.client, id), nil
+	return NewAdjudicatorSubFromChannelIDWithAssetFactory(ctx, a.client, id, a.assetFactory), nil
 }

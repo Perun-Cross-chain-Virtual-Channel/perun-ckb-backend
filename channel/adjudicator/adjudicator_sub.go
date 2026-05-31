@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"log"
 	"math"
 	"time"
 
@@ -27,14 +28,19 @@ type PollingSubscription struct {
 	client            client.CKBClient
 	id                channel.ID
 	pcts              *types.Script
-	events             chan channel.AdjudicatorEvent
-	err                error
-	cancel             context.CancelFunc
-	foundLiveCellOnce  bool
-	consecutiveMisses  int
-	concluded          chan struct{}
-	fatalErrors        chan error
-	challengeDuration  *time.Duration
+	events            chan channel.AdjudicatorEvent
+	err               error
+	cancel            context.CancelFunc
+	foundLiveCellOnce bool
+	consecutiveMisses int
+	concluded         chan struct{}
+	fatalErrors       chan error
+	challengeDuration *time.Duration
+	// assetFactory reconstructs the canonical channel.State emitted in a
+	// CoordinatedEvent from the on-chain molecule encoding. nil falls back to
+	// encoding.DefaultAssetFactory (raw CKB-backend assets); the multi-ledger
+	// harness supplies a factory that wraps assets to match the originals.
+	assetFactory encoding.AssetFactory
 }
 
 // ConcludeMissThreshold is the number of consecutive missed live-cell lookups
@@ -43,6 +49,14 @@ type PollingSubscription struct {
 const ConcludeMissThreshold = 3
 
 func NewAdjudicatorSubFromChannelID(ctx context.Context, ckbClient client.CKBClient, id channel.ID) *PollingSubscription {
+	return NewAdjudicatorSubFromChannelIDWithAssetFactory(ctx, ckbClient, id, nil)
+}
+
+// NewAdjudicatorSubFromChannelIDWithAssetFactory is like
+// NewAdjudicatorSubFromChannelID but lets the caller supply the AssetFactory
+// used to reconstruct the canonical state emitted in a CoordinatedEvent. A nil
+// factory falls back to encoding.DefaultAssetFactory.
+func NewAdjudicatorSubFromChannelIDWithAssetFactory(ctx context.Context, ckbClient client.CKBClient, id channel.ID, assetFactory encoding.AssetFactory) *PollingSubscription {
 	sub := &PollingSubscription{
 		PollingInterval: DefaultSubscriptionPollingInterval,
 		client:          ckbClient,
@@ -50,6 +64,7 @@ func NewAdjudicatorSubFromChannelID(ctx context.Context, ckbClient client.CKBCli
 		events:          make(chan channel.AdjudicatorEvent, DefaultBufferSize),
 		concluded:       make(chan struct{}, 1),
 		fatalErrors:     make(chan error, 1),
+		assetFactory:    assetFactory,
 	}
 	ctx, sub.cancel = context.WithCancel(ctx)
 	go sub.run(ctx)
@@ -136,9 +151,21 @@ func (a *PollingSubscription) emitEventIfNecessary(
 		return false
 	}
 
-	// If oldStatus is nil, then this is the first live cell we ever found, so we signal a status change but do not emit
-	// an event.
+	// If oldStatus is nil, this is the first live cell we ever observed. We
+	// establish it as the baseline. If the channel is ALREADY disputed or
+	// coordinated when we first see it, emit the corresponding event
+	// immediately: the transition may have happened before this subscription
+	// started (typical when a peer or the coordinator subscribes after the
+	// dispute landed, or when the poll interval is longer than the gap between
+	// funding and dispute). Without this, a late subscriber would wait forever
+	// for a transition that already occurred.
 	if oldStatus == nil {
+		if encoding.ToBool(*newStatus.Coordinated()) {
+			return a.emitCoordinated(newStatus)
+		}
+		if encoding.ToBool(*newStatus.Disputed()) {
+			return a.emitRegistered(ctx, newStatus, newBlockNumber)
+		}
 		return true
 	}
 
@@ -146,9 +173,25 @@ func (a *PollingSubscription) emitEventIfNecessary(
 	if bytes.Equal(oldStatus.AsSlice(), newStatus.AsSlice()) {
 		return false
 	}
+	log.Printf("adjudicator_sub: status changed (id=%x) funded=%v disputed=%v coordinated=%v",
+		a.id[:4],
+		encoding.ToBool(*newStatus.Funded()),
+		encoding.ToBool(*newStatus.Disputed()),
+		encoding.ToBool(*newStatus.Coordinated()),
+	)
 	if !encoding.ToBool(*oldStatus.Funded()) {
 		return true
 	}
+
+	// Coordinated supersedes disputed: the contract only allows coordinated to
+	// flip true after disputed is already set, so a false->true transition of
+	// coordinated is the canonical-settlement signal. Emit it before the
+	// dispute branch and carry the on-chain canonical state so the client's
+	// machine adopts it for withdrawal (see go-perun machine.SetCoordinated).
+	if encoding.ToBool(*newStatus.Coordinated()) && !encoding.ToBool(*oldStatus.Coordinated()) {
+		return a.emitCoordinated(newStatus)
+	}
+
 	if !encoding.ToBool(*newStatus.Disputed()) {
 		a.fatalErrors <- fmt.Errorf(
 			"adjudicator_sub: channel received update but is not disputed. oldStatus: %s, newStatus: %s",
@@ -157,26 +200,48 @@ func (a *PollingSubscription) emitEventIfNecessary(
 		)
 		return false
 	}
-	challengeDurationStart, err := a.getChallengeDurationStart(ctx, newBlockNumber)
+	return a.emitRegistered(ctx, newStatus, newBlockNumber)
+}
+
+// emitRegistered emits a RegisteredEvent for the given disputed status. The
+// challenge timeout is computed from the observation block; observing a dispute
+// late only pushes the deadline later, which is safe (the contract enforces the
+// real on-chain deadline regardless).
+func (a *PollingSubscription) emitRegistered(ctx context.Context, status *molecule.ChannelStatus, blockNumber client.BlockNumber) bool {
+	challengeDurationStart, err := a.getChallengeDurationStart(ctx, blockNumber)
 	if err != nil {
 		a.fatalErrors <- fmt.Errorf("could not get challenge duration start: %v", err)
 		return false
 	}
-
 	challengeDuration, err := a.getChallengeDuration()
 	if err != nil {
 		a.fatalErrors <- fmt.Errorf("could not get challenge duration: %v", err)
 		return false
 	}
-
-	event := channel.NewRegisteredEvent(
+	a.events <- channel.NewRegisteredEvent(
 		a.id,
 		&channel.TimeTimeout{Time: challengeDurationStart.Add(challengeDuration)},
-		molecule2.UnpackUint64(newStatus.State().Version()),
+		molecule2.UnpackUint64(status.State().Version()),
 		nil, // only needed for virtual channels
 		nil, // only needed for virtual channels
 	)
-	a.events <- event
+	return true
+}
+
+// emitCoordinated emits a CoordinatedEvent carrying the on-chain canonical
+// state reconstructed from the molecule encoding (see Layer 4 / UnpackChannelState).
+func (a *PollingSubscription) emitCoordinated(status *molecule.ChannelStatus) bool {
+	state, err := encoding.UnpackChannelState(status.State(), a.assetFactory)
+	if err != nil {
+		a.fatalErrors <- fmt.Errorf("could not unpack coordinated channel state: %v", err)
+		return false
+	}
+	a.events <- channel.NewCoordinatedEvent(
+		a.id,
+		&channel.ElapsedTimeout{},
+		state,
+		nil, // on-chain acceptance is authoritative; the client keeps its local sigs.
+	)
 	return true
 }
 
