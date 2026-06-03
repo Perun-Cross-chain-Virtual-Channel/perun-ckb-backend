@@ -18,11 +18,12 @@ package channel
 import (
 	"log"
 
+	"math/big"
+
 	"github.com/ethereum/go-ethereum/accounts/abi"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/pkg/errors"
-	"math/big"
 	"perun.network/go-perun/channel"
 	"perun.network/go-perun/channel/multi"
 	gpwallet "perun.network/go-perun/wallet"
@@ -125,7 +126,19 @@ func assetToCKBAsset(asset channel.Asset) ChannelAsset {
 			log.Panicf("Could not encode NervosAsset: %v", err)
 		}
 	default:
-		log.Panicf("expected asset of type NervosAsset, but got: %T", asset)
+		// A multi-ledger state reconstructed by the ETH backend during an
+		// ETH-side dispute of a CKB<->ETH channel carries the CKB asset row as a
+		// foreign cross-chain asset (perun-eth-backend's *CCAsset). Its
+		// MarshalBinary() already yields the NervosAsset encoding (CcHolder was
+		// set to nervosAsset.MarshalBinary()), so accept any BinaryMarshaler.
+		m, ok := asset.(interface{ MarshalBinary() ([]byte, error) })
+		if !ok {
+			log.Panicf("expected NervosAsset or a BinaryMarshaler asset, but got: %T", asset)
+		}
+		assetBytes, err = m.MarshalBinary()
+		if err != nil {
+			log.Panicf("Could not encode cross-chain asset: %v", err)
+		}
 	}
 
 	return ChannelAsset{
